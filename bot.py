@@ -1,177 +1,364 @@
-import asyncio
+
+import os
 import json
 import logging
-import os
-import re
+import asyncio
 from pathlib import Path
+from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 from telegram import Update
-from telegram.error import BadRequest, TelegramError
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+)
+from telegram.error import BadRequest
 from TikTokLive import TikTokLiveClient
 
+# ─────────────────────────────
+# CONFIGURATION
+# ─────────────────────────────
+
 load_dotenv()
-TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
-INTERVAL = max(30, int(os.getenv('CHECK_INTERVAL', '60')))
-DATA_FILE = Path(__file__).with_name('tracker_data.json')
-logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+
+BOT_TOKEN_ID = os.getenv("BOT_TOKEN_ID", "").strip()
+BOT_TOKEN_SECRET = os.getenv("BOT_TOKEN_SECRET", "").strip()
+
+TOKEN = f"{BOT_TOKEN_ID}:{BOT_TOKEN_SECRET}"
+
+INTERVAL = max(30, int(os.getenv("CHECK_INTERVAL", "60")))
+
+DATA_FILE = Path(__file__).with_name("tracker_data.json")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s"
+)
 log = logging.getLogger(__name__)
 
+if not BOT_TOKEN_ID or not BOT_TOKEN_SECRET:
+    raise ValueError(
+        "Missing BOT_TOKEN_ID or BOT_TOKEN_SECRET in Railway!"
+    )
+
+# ─────────────────────────────
+# DATA STORAGE
+# ─────────────────────────────
 
 def load_data():
-    try:
-        return json.loads(DATA_FILE.read_text(encoding='utf-8'))
-    except (OSError, ValueError):
-        return {}
-
-
-def save_data(data):
-    temp = DATA_FILE.with_suffix('.tmp')
-    temp.write_text(json.dumps(data, indent=2), encoding='utf-8')
-    temp.replace(DATA_FILE)
-
-
-def clean_username(value):
-    value = value.strip().removeprefix('@').lower()
-    return value if re.fullmatch(r'[a-z0-9._]{2,24}', value) else None
-
-
-def dashboard(chat):
-    users = chat.get('users', {})
-    lines = ['📡 TikTok LIVE Tracker', '', f'Tracking {len(users)} account(s)', '']
-    for username, status in sorted(users.items()):
-        marker = {'live': '🟢 LIVE', 'offline': '⚪ OFFLINE', 'unknown': '🟡 UNKNOWN'}.get(status, '🟡 UNKNOWN')
-        lines.append(f'@{username} — {marker}')
-    if not users:
-        lines.append('No accounts yet. Use /track username')
-    lines.extend(['', 'Statuses checked periodically. 🟡 means TikTok could not be checked.'])
-    return '\n'.join(lines)
-
-
-async def update_dashboard(bot, chat_id, chat, force=False):
-    content = dashboard(chat)
-    message_id = chat.get('message_id')
-    if message_id:
+    if DATA_FILE.exists():
         try:
-            await bot.edit_message_text(chat_id=int(chat_id), message_id=message_id, text=content)
-            return
-        except BadRequest as exc:
-            if 'Message is not modified' in str(exc):
-                return
-            log.warning('Cannot edit dashboard for %s: %s', chat_id, exc)
-        except TelegramError as exc:
-            log.warning('Dashboard edit failed for %s: %s', chat_id, exc)
-    message = await bot.send_message(chat_id=int(chat_id), text=content)
-    chat['message_id'] = message.message_id
+            return json.loads(DATA_FILE.read_text())
+        except (json.JSONDecodeError, OSError):
+            log.warning("Could not read saved tracking data.")
+    return {}
+
+data = load_data()
 
 
-async def track(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text('Usage: /track username')
-        return
-    username = clean_username(context.args[0])
-    if not username:
-        await update.message.reply_text('Invalid TikTok username.')
-        return
-    async with context.application.bot_data['lock']:
-        data = load_data()
-        chat = data.setdefault(str(update.effective_chat.id), {'users': {}})
-        chat.setdefault('users', {})
-        if username in chat['users']:
-            await update.message.reply_text(f'@{username} is already tracked.')
-            return
-        chat['users'][username] = 'unknown'
-        await update_dashboard(context.bot, update.effective_chat.id, chat)
-        save_data(data)
-    await update.message.reply_text(f'Now tracking @{username}.')
+def save_data():
+    DATA_FILE.write_text(json.dumps(data, indent=2))
 
 
-async def untrack(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text('Usage: /untrack username')
-        return
-    username = clean_username(context.args[0])
-    async with context.application.bot_data['lock']:
-        data = load_data()
-        chat = data.get(str(update.effective_chat.id), {'users': {}})
-        if not username or username not in chat.get('users', {}):
-            await update.message.reply_text('That account is not tracked.')
-            return
-        del chat['users'][username]
-        await update_dashboard(context.bot, update.effective_chat.id, chat)
-        data[str(update.effective_chat.id)] = chat
-        save_data(data)
-    await update.message.reply_text(f'Stopped tracking @{username}.')
+def get_chat(chat_id):
+    key = str(chat_id)
+
+    if key not in data:
+        data[key] = {
+            "users": {},
+            "message_id": None
+        }
+
+    return data[key]
 
 
-async def untrackall(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    async with context.application.bot_data['lock']:
-        data = load_data()
-        chat = data.setdefault(str(update.effective_chat.id), {'users': {}})
-        chat['users'] = {}
-        await update_dashboard(context.bot, update.effective_chat.id, chat)
-        save_data(data)
-    await update.message.reply_text('All accounts removed.')
-
-
-async def tracking(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    async with context.application.bot_data['lock']:
-        data = load_data()
-        chat = data.setdefault(str(update.effective_chat.id), {'users': {}})
-        await update_dashboard(context.bot, update.effective_chat.id, chat)
-        save_data(data)
-    await update.message.reply_text('Dashboard is up to date.')
-
+# ─────────────────────────────
+# TIKTOK LIVE CHECKING
+# ─────────────────────────────
 
 async def check_live(username):
     try:
         client = TikTokLiveClient(unique_id=username)
-        result = await asyncio.wait_for(client.is_live(), timeout=20)
-        return 'live' if result else 'offline'
-    except Exception as exc:
-        log.warning('TikTok check failed for @%s: %s', username, exc)
-        return 'unknown'
+
+        result = await asyncio.wait_for(
+            client.is_live(),
+            timeout=20
+        )
+
+        return bool(result)
+
+    except Exception as e:
+        log.warning(
+            "Could not check @%s: %s",
+            username,
+            e
+        )
+        return None
 
 
-async def check_all(context: ContextTypes.DEFAULT_TYPE):
-    app = context.application
-    if app.bot_data['lock'].locked():
+def status_text(status):
+    if status is True:
+        return "🟢 LIVE"
+    if status is False:
+        return "⚫ OFFLINE"
+    return "⚪ UNKNOWN"
+
+
+# ─────────────────────────────
+# DASHBOARD
+# ─────────────────────────────
+
+def build_dashboard(chat):
+    lines = [
+        "📡 TIKTOK LIVE TRACKER",
+        "━━━━━━━━━━━━━━━━━━",
+        ""
+    ]
+
+    users = chat["users"]
+
+    if not users:
+        lines.append("No TikTok accounts tracked yet.")
+        lines.append("")
+        lines.append("Use /track username to add one.")
+
+    else:
+        for username, status in sorted(users.items()):
+            lines.append(
+                f"@{username} — {status_text(status)}"
+            )
+
+    lines.extend([
+        "",
+        "━━━━━━━━━━━━━━━━━━",
+        f"🔄 Checks every {INTERVAL} seconds",
+        "📍 Statuses update automatically"
+    ])
+
+    return "\n".join(lines)
+
+
+async def update_dashboard(bot, chat_id):
+    chat = get_chat(chat_id)
+    text = build_dashboard(chat)
+
+    message_id = chat.get("message_id")
+
+    if message_id:
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=text
+            )
+            return
+
+        except BadRequest as e:
+            if "Message is not modified" in str(e):
+                return
+            log.warning("Dashboard edit failed: %s", e)
+
+    message = await bot.send_message(
+        chat_id=chat_id,
+        text=text
+    )
+
+    chat["message_id"] = message.message_id
+    save_data()
+
+
+async def refresh_chat(bot, chat_id):
+    chat = get_chat(chat_id)
+
+    for username in list(chat["users"]):
+        result = await check_live(username)
+
+        if result is not None:
+            chat["users"][username] = result
+
+    save_data()
+    await update_dashboard(bot, chat_id)
+
+
+# ─────────────────────────────
+# TELEGRAM COMMANDS
+# ─────────────────────────────
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📡 Welcome to TikTok LIVE Tracker!\n\n"
+        "Track TikTok creators and see when they go LIVE.\n\n"
+        "Use /track username to begin.\n"
+        "Use /help to see all commands."
+    )
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📡 TIKTOK LIVE TRACKER COMMANDS\n\n"
+        "/start — Start the bot\n"
+        "/track username — Track a TikTok user\n"
+        "/untrack username — Stop tracking a user\n"
+        "/untrackall — Remove all tracked users\n"
+        "/tracking — Show the LIVE dashboard\n"
+        "/refresh — Refresh LIVE statuses\n"
+        "/help — Show this command list"
+    )
+
+
+async def track(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: /track username"
+        )
         return
-    async with app.bot_data['lock']:
-        data = load_data()
-        changed = False
-        for chat_id, chat in data.items():
-            for username, previous in list(chat.get('users', {}).items()):
-                status = await check_live(username)
-                if status != previous:
-                    chat['users'][username] = status
-                    changed = True
-            if changed:
-                try:
-                    await update_dashboard(context.bot, chat_id, chat)
-                except TelegramError as exc:
-                    log.warning('Could not update chat %s: %s', chat_id, exc)
-        if changed:
-            save_data(data)
+
+    username = context.args[0].lstrip("@").lower()
+    chat_id = update.effective_chat.id
+    chat = get_chat(chat_id)
+
+    if username in chat["users"]:
+        await update.message.reply_text(
+            f"@{username} is already being tracked!"
+        )
+        return
+
+    chat["users"][username] = None
+    save_data()
+
+    await update.message.reply_text(
+        f"✅ Now tracking @{username}!"
+    )
+
+    await refresh_chat(context.bot, chat_id)
+
+
+async def untrack(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: /untrack username"
+        )
+        return
+
+    username = context.args[0].lstrip("@").lower()
+    chat_id = update.effective_chat.id
+    chat = get_chat(chat_id)
+
+    if username not in chat["users"]:
+        await update.message.reply_text(
+            f"@{username} is not being tracked."
+        )
+        return
+
+    del chat["users"][username]
+    save_data()
+
+    await update_dashboard(context.bot, chat_id)
+
+    await update.message.reply_text(
+        f"✅ Stopped tracking @{username}."
+    )
+
+
+async def untrackall(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    chat = get_chat(chat_id)
+
+    chat["users"].clear()
+    save_data()
+
+    await update_dashboard(context.bot, chat_id)
+
+    await update.message.reply_text(
+        "✅ All TikTok accounts have been removed!"
+    )
+
+
+async def tracking(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update_dashboard(
+        context.bot,
+        update.effective_chat.id
+    )
 
 
 async def refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('Checking LIVE statuses now…')
-    await check_all(context)
+    chat_id = update.effective_chat.id
 
+    await update.message.reply_text(
+        "🔄 Checking TikTok LIVE statuses..."
+    )
+
+    await refresh_chat(context.bot, chat_id)
+
+
+# ─────────────────────────────
+# AUTOMATIC REFRESH
+# ─────────────────────────────
+
+async def auto_refresh(application):
+    while True:
+        await asyncio.sleep(INTERVAL)
+
+        for chat_id in list(data.keys()):
+            try:
+                await refresh_chat(
+                    application.bot,
+                    int(chat_id)
+                )
+            except Exception as e:
+                log.error(
+                    "Auto refresh failed for %s: %s",
+                    chat_id,
+                    e
+                )
+
+
+async def post_init(application):
+    application.bot_data["refresh_task"] = (
+        asyncio.create_task(auto_refresh(application))
+    )
+
+    log.info("Automatic LIVE tracking started.")
+
+
+async def post_shutdown(application):
+    task = application.bot_data.get("refresh_task")
+
+    if task:
+        task.cancel()
+
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
+# ─────────────────────────────
+# START BOT
+# ─────────────────────────────
 
 def main():
-    if not TOKEN or TOKEN == 'PASTE_YOUR_BOTFATHER_TOKEN_HERE':
-        raise SystemExit('Set TELEGRAM_BOT_TOKEN in .env first.')
-    app = Application.builder().token(TOKEN).build()
-    app.bot_data['lock'] = asyncio.Lock()
-    for name, handler in [('track', track), ('untrack', untrack), ('untrackall', untrackall), ('tracking', tracking), ('refresh', refresh)]:
-        app.add_handler(CommandHandler(name, handler))
-    app.job_queue.run_repeating(check_all, interval=INTERVAL, first=5)
-    log.info('TikTok Telegram tracker started.')
-    app.run_polling()
+    application = (
+        Application.builder()
+        .token(TOKEN)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("track", track))
+    application.add_handler(CommandHandler("untrack", untrack))
+    application.add_handler(CommandHandler("untrackall", untrackall))
+    application.add_handler(CommandHandler("tracking", tracking))
+    application.add_handler(CommandHandler("refresh", refresh))
+
+    log.info("TikTok Telegram tracker starting...")
+
+    application.run_polling()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
