@@ -99,10 +99,10 @@ async def check_live(username):
 
 def status_text(status):
     if status is True:
-        return "🟢 LIVE"
+        return "🔴 LIVE"
     if status is False:
-        return "⚫ OFFLINE"
-    return "⚪ UNKNOWN"
+        return "⚪️ OFFLINE"
+    return "❓ UNKNOWN"
 
 
 # ─────────────────────────────
